@@ -1,0 +1,448 @@
+//https://paulbourke.net/geometry/chladni/
+//https://www.youtube.com/watch?v=J-siGcsK2k8
+
+let particles = [];
+let particleCount = 2500; 
+let modeM = 5; 
+let modeN = 2; 
+let threshold = 0.5; 
+let controller;
+
+// Set for visual polyphony
+let activeNotes = new Set(); 
+
+// Track keys to prevent repeat
+let keysHeld = {};
+
+// Text Particle Targets
+let textTargets = [];
+
+// --- Audio Engine Variables ---
+let polySynth;    // Background chords
+let droneSynth;   // Dedicated synth for the drone
+let ufoOsc;       // Raw Oscillator for the Portamento Lead
+let chordDelay;   // Space echoes for chords
+let ufoDelay;     // Space echoes for the UFO
+let reverb;       // NEW: Lush stadium reverb for the Psych rock vibe
+let lpf;          // Low-pass filter for the pad sound
+let audioStarted = false;
+
+// Note Mappings (Shifted up 1 octave, adding 12 to MIDI note numbers)
+let noteMappings = {
+  60: {m:1, n:1},  // C4
+  61: {m:1, n:1},  // C#4 
+  62: {m:9, n:8},  // D4
+  63: {m:9, n:8},  // D#4 
+  64: {m:5, n:4},  // E4
+  65: {m:4, n:3},  // F4
+  66: {m:4, n:3},  // F#4 
+  67: {m:3, n:2},  // G4
+  68: {m:3, n:2},  // G#4 
+  69: {m:5, n:3},  // A4
+  70: {m:5, n:3},  // A#4 
+  71: {m:15, n:8}, // B4
+  72: {m:2, n:1},  // C5
+  73: {m:2, n:1},  // C#5 
+  74: {m:9, n:4},  // D5
+  75: {m:9, n:4},  // D#5 
+  76: {m:5, n:2},  // E5
+  77: {m:8, n:3},  // F5
+  78: {m:8, n:3},  // F#5 
+  79: {m:3, n:1},  // G5
+  80: {m:3, n:1},  // G#5 
+  81: {m:10, n:3}, // A5
+  82: {m:10, n:3}, // A#5 
+  83: {m:15, n:4}, // B5
+  84: {m:4, n:1},  // C6
+};
+
+// Keyboard Map (Shifted up 1 octave)
+let keyboardMap = {
+  'z': 60, 'x': 62, 'c': 64, 'v': 65, 'b': 67, 'n': 69, 'm': 71, 
+  'a': 72, 'w': 73, 's': 74, 'e': 75, 'd': 76, 'f': 77, 't': 78, 'g': 79, 'y': 80, 'h': 81, 'u': 82, 'j': 83, 'k': 84 
+};
+
+function setup() {
+  // Make the canvas completely fill the screen
+  createCanvas(windowWidth, windowHeight);
+  
+  // Lower the master volume slightly more to prevent any residual clipping
+  outputVolume(0.85);
+
+  // --- Initialize Audio Effects & Synths ---
+  lpf = new p5.LowPass();
+  lpf.freq(400); 
+  // Lowered resonance to tame the sharp high-end squelch
+  lpf.res(1.5); 
+
+  polySynth = new p5.PolySynth();
+  droneSynth = new p5.MonoSynth(); 
+
+  // Route chords and drone through the filter
+  polySynth.disconnect();
+  polySynth.connect(lpf);
+  droneSynth.disconnect();
+  droneSynth.connect(lpf);
+
+  // Drone: Set to a deep sine wave
+  droneSynth.oscillator.setType('sine');
+  droneSynth.setADSR(0.5, 0.5, 0.8, 2.0); 
+
+  // Polyphonic keys: Square waves for that classic indie/psych synthesizer feel
+  // Snappier attack (0.05) so the notes "bite" before echoing
+  polySynth.setADSR(0.05, 0.3, 0.5, 1.5); 
+  try {
+    for (let i = 0; i < polySynth.audiovoices.length; i++) {
+      polySynth.audiovoices[i].oscillator.setType('square');
+    }
+  } catch (e) {
+    console.log("Could not set polySynth wave types:", e);
+  }
+
+  // --- UFO PORTAMENTO SYNTH ---
+  // Changed to a triangle wave so it has a little more buzz/fuzz to cut through the reverb
+  ufoOsc = new p5.Oscillator('triangle'); 
+  ufoOsc.start();
+  ufoOsc.amp(0); 
+
+  // --- PSYCHEDELIC DELAYS & REVERB ---
+  chordDelay = new p5.Delay();
+  chordDelay.process(polySynth, 0.45, 0.5, 2300); 
+
+  ufoDelay = new p5.Delay();
+  ufoDelay.process(ufoOsc, 0.33, 0.3, 3000); 
+
+  // HUGE Reverb to give it that stadium / washed out Tame Impala atmosphere
+  reverb = new p5.Reverb();
+  reverb.process(polySynth, 6, 2); // 6 seconds decay
+  reverb.process(ufoOsc, 4, 1);
+  reverb.process(droneSynth, 4, 1);
+  // -----------------------------------------
+
+  // Generate text targets safely for the particles
+  createTextTargets();
+
+  // Safely initialize MIDI using try/catch. 
+  try {
+    if (navigator.requestMIDIAccess) {
+      WebMidi.enable(onMidiEnabled);
+    } else {
+      console.log("Web MIDI is not supported.");
+    }
+  } catch (error) {
+    console.log("Web MIDI blocked (likely due to local file restrictions). Keyboard will still work!", error);
+  }
+  
+  for (let i = 0; i < particleCount; i++) {
+    particles.push(new particle());
+  }
+}
+
+// Secretly draws "Digital Chladni" on an invisible canvas to get the coordinates of the letters
+function createTextTargets() {
+  textTargets = [];
+  
+  // Safe bounds matching the full screen canvas
+  let w = max(100, width);
+  let h = max(100, height);
+  let minDim = min(w, h); // Use the smallest dimension to scale the font properly without stretching
+
+  // Create an off-screen buffer
+  let pg = createGraphics(w, h);
+  pg.pixelDensity(1); 
+  pg.background(0);
+  pg.fill(255);
+  pg.textAlign(CENTER, CENTER);
+  pg.textFont('Georgia');
+  pg.textStyle(ITALIC);
+  
+  // Large dynamic font size based on the smallest dimension to ensure it always fits
+  let fSize = minDim * 0.27; 
+  pg.textSize(fSize);
+  
+  // Adjust the vertical spacing between the two lines based on the new font size
+  let lSpacing = fSize * 0.95;
+  pg.textLeading(lSpacing);
+  
+  // Split the text onto two lines
+  pg.text("Digital\nChladni", w / 2, h / 2);
+  
+  try {
+    pg.loadPixels();
+    // Scan the buffer for white pixels
+    for (let y = 0; y < pg.height; y += 4) {
+      for (let x = 0; x < pg.width; x += 4) {
+        let index = (x + y * pg.width) * 4;
+        if (pg.pixels[index] > 128) {
+          textTargets.push(createVector(x, y));
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("Could not load pixels for text generation:", err);
+  }
+  
+  pg.remove(); // Delete the invisible canvas to save memory
+  
+  // Re-assign new targets if particles exist
+  for (let p of particles) {
+    if (textTargets.length > 0) {
+      p.targetIndex = floor(random(textTargets.length));
+    }
+  }
+}
+
+function draw() {
+  background(0,0,0,50);
+  
+  modeM = map(mouseX, 0, width, 2, 5);
+  modeN = map(mouseY, 0, width, 2, 5);
+
+  // --- SOFTWARE LFOs (Low Frequency Oscillators) ---
+  if (audioStarted && activeNotes.size > 0) {
+    let t = millis() / 1000;
+    
+    // LFO 1: Stereo Wobble (Brain Tickle)
+    let panLFO = sin(t * 8 * TWO_PI) * 0.5;
+    ufoOsc.pan(panLFO);
+
+    // LFO 2: Filter Sweep (Breathe Effect)
+    // Lowered the max frequency from 2500 down to 1200 to significantly reduce sharp highs
+    let sweepLFO = map(sin(t * 0.2 * TWO_PI), -1, 1, 250, 1200);
+    lpf.freq(sweepLFO);
+  }
+  // --------------------------------------------------
+
+  for (let i=0; i < particles.length; i++) { 
+    particles[i].update(); 
+    particles[i].display(); 
+  }
+}
+
+function windowResized() {
+  // Fill the screen on resize
+  resizeCanvas(windowWidth, windowHeight);
+  createTextTargets();
+}
+
+// Ensure audio context starts regardless of mouse click or key press
+function ensureAudioStarted() {
+  if (!audioStarted) {
+    userStartAudio();
+    audioStarted = true;
+  }
+}
+
+function mousePressed() {
+  ensureAudioStarted();
+}
+
+// POLYPHONIC CYMATIC FUNCTION
+function cymatic(x, y) {
+  let L = 1;
+  let totalWaves = 0; 
+
+  // Iterate through all currently active notes
+  for (let note of activeNotes) { 
+    if (noteMappings[note]) { 
+      let noteM = noteMappings[note].m; 
+      let noteN = noteMappings[note].n;
+      
+      // Calculate wave for this specific note
+      let wave = cos(noteN * PI * x / L) * cos(noteM * PI * y / L) + cos(noteM * PI * x / L) * cos(noteN * PI * y / L); 
+      
+      totalWaves += wave; 
+    }
+  }
+
+  if (activeNotes.size > 0) {
+    return totalWaves / activeNotes.size; // Average the waves
+  } else {
+    return 0; 
+  }
+}
+
+class particle {
+  constructor() { 
+    this.position = createVector(random(0,width), random(0,height)); 
+    this.targetIndex = 0;
+    if (textTargets.length > 0) {
+      this.targetIndex = floor(random(textTargets.length));
+    }
+  }
+
+  edges() { 
+    if (this.position.x > width) this.position.x = 0;
+    else if (this.position.x < 0) this.position.x = width;
+    
+    if (this.position.y > height) this.position.y = 0;
+    else if (this.position.y < 0) this.position.y = height;
+  }
+
+  update() {
+    if (activeNotes.size > 0) { 
+      // --- CYMATIC MODE (Notes are playing) ---
+      let minDim = min(width, height);
+      
+      // Calculate coordinates from the center to prevent stretching on widescreen monitors
+      // This maintains a 1:1 aspect ratio for the math, letting the pattern continue off-screen smoothly
+      let x = (this.position.x - width / 2) / minDim + 0.5;
+      let y = (this.position.y - height / 2) / minDim + 0.5;
+
+      let value = cymatic(x,y); 
+
+      let vibrate = 0.05 + (abs(value) * 25); 
+
+      this.position.x += random(-vibrate, vibrate); 
+      this.position.y += random(-vibrate, vibrate);
+      this.edges(); 
+    } else {
+      // --- IDLE MODE (Form the words "Digital Chladni") ---
+      if (textTargets.length > 0) {
+        let target = textTargets[this.targetIndex];
+        
+        // Gently glide towards the target coordinate
+        this.position.x = lerp(this.position.x, target.x, 0.05);
+        this.position.y = lerp(this.position.y, target.y, 0.05);
+        
+        // Add a tiny bit of random motion so the letters look alive like a swarm
+        this.position.x += random(-1.5, 1.5);
+        this.position.y += random(-1.5, 1.5);
+      } else {
+        // Fallback in case the text generator failed
+        let scatter = 30;
+        this.position.x += random(-scatter, scatter); 
+        this.position.y += random(-scatter, scatter);
+        this.edges();
+      }
+    }
+  }
+
+  display() {
+    stroke(255);
+    strokeWeight(1.5);
+    point(this.position.x, this.position.y);
+  }
+}
+
+// --- UNIVERSAL NOTE HANDLERS (Audio + Visuals) ---
+
+function triggerNote(noteNumber, velocity) {
+  ensureAudioStarted();
+
+  if (!activeNotes.has(noteNumber)) {
+    
+    let targetFreq = midiToFreq(noteNumber);
+
+    // --- START SYNTHS ---
+    if (activeNotes.size === 0) {
+      // First Key Pressed: Start Drone and UFO Lead Instantly
+      let droneFreq = midiToFreq(36); // 36 is C2 Drone (Deeper)
+      if (droneSynth) droneSynth.triggerAttack(droneFreq, 0.08); 
+      
+      if (ufoOsc) {
+        ufoOsc.freq(targetFreq); // Lock pitch immediately
+        ufoOsc.amp(0.04, 0.3);   
+      }
+    } else {
+      // Subsequent Keys Pressed: Glide the UFO Lead to the new note (PORTAMENTO)
+      if (ufoOsc) ufoOsc.freq(targetFreq, 0.4); // 0.4s glide
+    }
+
+    // 1. Visuals: Add to Set
+    activeNotes.add(noteNumber);
+    
+    // 2. Chords: Start PolySynth Voice
+    // Very low individual voice volume since square waves and reverb stack up loudly
+    let vol = velocity ? map(velocity, 0, 127, 0, 0.04) : 0.04; 
+    if(polySynth) polySynth.noteAttack(targetFreq, vol);
+  }
+}
+
+function releaseNote(noteNumber) {
+  if (activeNotes.has(noteNumber)) {
+    
+    // 1. Visuals: Remove from Set
+    activeNotes.delete(noteNumber);
+    
+    // 2. Chords: Release PolySynth Voice
+    let freq = midiToFreq(noteNumber);
+    if(polySynth) polySynth.noteRelease(freq);
+    
+    // --- STOP SYNTHS ---
+    if (activeNotes.size === 0) {
+      // Last Key Released: Stop Drone and UFO Lead
+      if (droneSynth) droneSynth.triggerRelease();
+      if (ufoOsc) ufoOsc.amp(0, 0.5); // Fade volume out
+
+      // Give the particles a fresh, random target letter to float back to
+      if (textTargets.length > 0) {
+        for (let p of particles) {
+          p.targetIndex = floor(random(textTargets.length));
+        }
+      }
+
+    } else {
+      // Glide back to the most recently pressed active note
+      let remainingNotes = Array.from(activeNotes);
+      let lastNote = remainingNotes[remainingNotes.length - 1]; 
+      if (ufoOsc && lastNote) {
+        ufoOsc.freq(midiToFreq(lastNote), 0.4);
+      }
+    }
+  }
+}
+
+// --- MIDI FUNCTIONS ---
+
+function onMidiEnabled(err) {
+  if (err) {
+    console.log("WebMidi error:", err);
+    return;
+  }
+  if (WebMidi.inputs.length < 1) {
+    console.log("No MIDI Inputs. Use Keyboard.");
+  } else {
+    for (let i = 0; i < WebMidi.inputs.length; i++) {
+      let input = WebMidi.inputs[i];
+      console.log(`Connected: ${input.name}`);
+      input.addListener('noteon', 'all', onNoteOn);
+      input.addListener('noteoff', 'all', onNoteOff);
+    }
+  }
+}
+
+function onNoteOn(event) {
+  triggerNote(event.note.number, 100);
+}
+
+function onNoteOff(event) {
+  releaseNote(event.note.number);
+}
+
+// --- KEYBOARD FUNCTIONS ---
+
+function keyPressed() {
+  ensureAudioStarted(); 
+  let k = key.toLowerCase();
+  
+  // Toggle fullscreen when 'p' is pressed
+  if (k === 'p') {
+    let fs = fullscreen();
+    fullscreen(!fs);
+    return;
+  }
+  
+  if (keyboardMap[k] && !keysHeld[k]) {
+    keysHeld[k] = true;
+    triggerNote(keyboardMap[k], 100); 
+  }
+}
+
+function keyReleased() {
+  let k = key.toLowerCase();
+  if (keyboardMap[k]) {
+    keysHeld[k] = false;
+    releaseNote(keyboardMap[k]);
+  }
+}
